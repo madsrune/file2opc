@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <inttypes.h>
@@ -59,9 +60,10 @@ void print_usage()
     "                                [-p <tcp port> (7890)]\n" \
     "                                [-u <usb device>]\n" \
     "                                [-f <frame rate> (30fps)]\n" \
-    "                                [-a 0|1 (0)] (random start) \n"
-    "                                [-l 0|1 (1)] (loop)\n"
-    "                                [-R <remote event device>]\n\n");
+    "                                [-a 0|1 (0)] (random start) \n" \
+    "                                [-l 0|1 (1)] (loop)\n" \
+    "                                [-R <remote event device>]\n" \
+    "                                [-L 0|1 (0)] enable LIRC\n\n");
 }
 
 
@@ -88,6 +90,23 @@ const int port
     .sin_port = htons(port)
   };
   inet_pton(AF_INET, host, &addr.sin_addr.s_addr);
+
+  if (sock < 0)
+    return -1;
+  if (connect(sock, (const struct sockaddr*) &addr, sizeof(addr)) < 0)
+    return -1;
+
+  return sock;
+}
+
+static int
+unix_socket(
+const char* path)
+{
+  const int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+  struct sockaddr_un addr;
+  addr.sun_family = AF_UNIX;
+  strcpy(addr.sun_path, path);
 
   if (sock < 0)
     return -1;
@@ -126,7 +145,7 @@ void* event_thread(void* arg)
             printf(" ON \n");
           ev_data->mode = 1;
           break;
-          
+
         case 63: // "O"
           ev_data->frame_rate = ev_data->base_frame_rate;
           ev_data->brightness_target = 1.0;
@@ -166,14 +185,81 @@ void* event_thread(void* arg)
           printf(" Remote code: %d\n", event.code);
           break;
         }
-        
+
         ev_data->write_delay = 100;
       }
     }
   }
 }
 
+void* lirc_thread(void* arg)
+{
+  ev_data_t* ev_data = (ev_data_t*)arg;
+  char buf[128];
+  char* part;
 
+  while (TRUE)
+  {
+    int bytes_read = read(ev_data->fd, buf, 128);
+    if (bytes_read <= 0)
+      continue;
+
+    part = strtok(buf, "_");
+    part = strtok(NULL, " ");
+
+    if (strcmp(part, "F1") == 0) // "power"
+    {
+      if (ev_data->mode != 0)
+        printf(" OFF \n");
+      ev_data->mode = 0;
+    }
+    else if (strcmp(part, "F2") == 0 || // "A"
+             strcmp(part, "F3") == 0 || // "B"
+             strcmp(part, "F4") == 0)   // "C"
+    {
+      if (ev_data->mode != 1)
+        printf(" ON \n");
+      ev_data->mode = 1;
+    }
+    else if (strcmp(part, "KP5") == 0) // "O"
+    {
+          ev_data->frame_rate = ev_data->base_frame_rate;
+          ev_data->brightness_target = 1.0;
+    }
+    else if (strcmp(part, "KP6") == 0) // "right"
+    {
+      if (ev_data->frame_rate < ev_data->base_frame_rate*1.5)
+        ev_data->frame_rate++;
+      printf(" Frame rate: %d fps\n", ev_data->frame_rate);
+    }
+    else if (strcmp(part, "KP4") == 0) // "left"
+    {
+      if (ev_data->frame_rate > ev_data->base_frame_rate*0.5)
+        ev_data->frame_rate--;
+      printf(" Frame rate: %d fps\n", ev_data->frame_rate);
+    }
+    else if (strcmp(part, "KP8") == 0) // "up"
+    {
+      ev_data->brightness_target += 0.01;
+      if (ev_data->brightness_target > 1.0)
+        ev_data->brightness_target = 1.0;
+
+      printf(" Brightness: %0.2f \n", ev_data->brightness_target);
+    }
+    else if (strcmp(part, "KP2") == 0) // "down"
+    {
+      ev_data->brightness_target -= 0.01;
+      if (ev_data->brightness_target < 0.2)
+        ev_data->brightness_target = 0.2;
+
+      printf(" Brightness: %0.2f \n", ev_data->brightness_target);
+    }
+    else
+      printf("Received unknown LIRC KEY_%s\n", part);
+
+    ev_data->write_delay = 100;
+  }
+}
 
 int
 main(
@@ -200,9 +286,12 @@ char ** argv
 
   int randomStart = FALSE;
 
-  fprintf(stderr, "OpenPixelControl File Reader\nMads Christensen (c) 2017, www.madschristensen.info\n\n");
+  int lirc = FALSE;
+  int fd_lirc = 0;
 
-  while ((opt = getopt(argc, argv, "h:p:u:r:l:a:f:R:")) != -1)
+  fprintf(stderr, "OpenPixelControl File Reader\nMads Christensen (c) 2015-2018, www.madschristensen.info\n\n");
+
+  while ((opt = getopt(argc, argv, "h:p:u:r:l:a:f:R:L:")) != -1)
   {
     switch (opt)
     {
@@ -239,6 +328,10 @@ char ** argv
       strncpy(remote, optarg, DEV_NAME_MAX);
       break;
 
+    case 'L':
+      lirc = TRUE;
+      break;
+
     case 'u':
       strncpy(usb, optarg, DEV_NAME_MAX);
       break;
@@ -261,7 +354,7 @@ char ** argv
   ev_data.mode = 1; // start on
   ev_data.brightness_target = 1.0; // full brightness
   ev_data.frame_rate = ev_data.base_frame_rate = frame_rate;
-  
+
   // Read saved settings
   char cfg[DEV_NAME_MAX+1];
   strncpy(cfg, argv[0], DEV_NAME_MAX-4);
@@ -275,13 +368,13 @@ char ** argv
     if (brightness < 0.2 || brightness > 1.0)
       brightness = 1.0;
     ev_data.brightness_target = brightness;
-    
+
     int fr;
     read(fd_cfg, &fr, sizeof(fr));
     if (fr < 0.5*frame_rate || fr > 1.5*frame_rate)
       fr = frame_rate;
-    ev_data.frame_rate = fr;  
-      
+    ev_data.frame_rate = fr;
+
     close(fd_cfg);
   }
 
@@ -297,6 +390,13 @@ char ** argv
       printf("Listening for input events on: %s\n", remote);
       pthread_create(&ev_data.ev_t, NULL, &event_thread, &ev_data);
     }
+  }
+  else if (lirc)
+  {
+    if ((ev_data.fd = unix_socket("/var/run/lirc/lircd")) < 0)
+      printf("Connect to lircd failed: %s\n", strerror(errno));
+    else
+      pthread_create(&ev_data.ev_t, NULL, &lirc_thread, &ev_data);
   }
 
   // Open connection to USB output device (Teensy3)
@@ -392,7 +492,7 @@ char ** argv
         printf("%d frames in this file, starting at frame %d, position %d\n", fFrames, startFrame, startFrame*frameSize);
         continue; // read a new frame right away
       }
-      
+
       firstPacket = FALSE;
       printf("OPC header: channel=%d command=%d size=%d\n", cmd.channel, cmd.command, dataSize);
     }
@@ -440,7 +540,7 @@ char ** argv
     if (cmd.command != 0)
       continue;
 
-    // Calculate brightness	
+    // Calculate brightness
     if (ev_data.mode != 0)
       ev_data.brightness += (ev_data.brightness_target - ev_data.brightness) * .03;
     else
